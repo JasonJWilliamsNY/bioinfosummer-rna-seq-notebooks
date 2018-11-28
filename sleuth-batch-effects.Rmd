@@ -1,0 +1,261 @@
+---
+title: "Sleuth RNA-Seq Tutorial"
+output: html_notebook
+---
+
+This tutorial will take you through a sample RNA-Seq analysis using performed by [kallisto](https://pachterlab.github.io/kallisto/about), using an RNA-Seq R package [Sleuth](https://pachterlab.github.io/sleuth/about). This tutorial is based on the one by the [Pachter lab](https://pachterlab.github.io/sleuth_walkthroughs/boj/analysis.html). 
+
+## Install Kallisto 
+
+Installation instructions for Kallisto are [available here](https://pachterlab.github.io/sleuth/download). This make take a few minute so we have done this for you. The commented code is FYI. 
+
+```{r message=FALSE}
+
+source("http://bioconductor.org/biocLite.R")
+#biocLite("rhdf5")
+#install.packages("devtools")
+#devtools::install_github("pachterlab/sleuth")
+```
+
+
+Next, we need to load the Sleuth library to begin. We will also check the version:
+```{r message=FALSE}
+library("sleuth")
+packageVersion("sleuth")
+```
+
+## Locate sample names and describe our experimental design
+
+We need to provide Sleuth with our sample names, which in our case are based on our SRA Run information:
+
+```{r}
+sample_id <- dir(file.path("~/analysis/"))
+sample_id
+```
+
+We also need to get the file paths to our results files. 
+```{r}
+kal_dirs <- file.path("~/analysis", sample_id)
+```
+
+We also need to create a table that provides more meaningful names for describing our experiment. Let's use the sample ids as the first column in our table. We provide here our own choice of names for the samples as provided from the [SRA dataset](https://www.ncbi.nlm.nih.gov/sra?term=SRP003234)
+
+```{r}
+experiment_info <- data.frame(sample=sample_id, 
+                              condition = c(
+                                "ap1_stage4", 
+                                "ap1_stage4", 
+                                "ap1_stage6-7",
+                                "ap1_stage6-7", 
+                                "ap1_stage6-7", 
+                                "ap3_stage4",
+                                "ap3_stage4",
+                                "ap3_stage6",
+                                "ap3_stage6",
+                                "ap3_stage6",
+                                "ap3_stage6",
+                                "ag_stage6",
+                                "ag_stage6",
+                                "ag_stage4",
+                                "ag_stage4",
+                                "total_transctriptome",
+                                "total_transctriptome",
+                                "translatome", 
+                                "translatome"
+                              ))
+```
+
+
+
+We will add our filepaths to the table
+
+```{r}
+s2c <- dplyr::mutate(experiment_info, path = kal_dirs)
+```
+
+Let's view the table we have created:
+```{r}
+s2c
+```
+
+Let's just compare the AP3 domain translatome against whole translatome. To do this we will select the appropriate subset of our table: 
+
+```{r}
+desired_conditions <- c("ap3_stage6",
+                        "total_transctriptome")
+s2c <- dplyr::filter(s2c, condition %in% desired_conditions)
+s2c
+```
+
+
+
+We will also install a plotting library and some other functions we will need...
+
+```{r}
+install.packages("gridExtra")
+install.packages("cowplot")
+library(cowplot)
+library(gridExtra)
+```
+
+## Get gene names from biomaRt 
+
+Before we look at our data, lets use [biomaRt](https://bioconductor.org/packages/release/bioc/html/biomaRt.html) tools will allow us to pull in recognizable gene names from a database. 
+
+First let's install and load BiomRart. **(this will take a few minutes!)**. 
+
+```{r}
+source("https://bioconductor.org/biocLite.R")
+biocLite("biomaRt")
+```
+
+Next we need to determine which biomaRt to use. This can be a little complex so 
+be sure to read their [documentation](https://www.bioconductor.org/packages/devel/bioc/vignettes/biomaRt/inst/doc/biomaRt.html) and this [blog post](https://nsaunders.wordpress.com/2015/04/28/some-basics-of-biomart/) is also helpful. 
+
+```{r}
+library(biomaRt)
+marts <- listMarts()
+marts
+```
+
+If you are not working with these Ensembl data bases you may want to check out documentation on [using BiomaRts other than Ensembl](https://bioconductor.org/packages/release/bioc/vignettes/biomaRt/inst/doc/biomaRt.html#using-a-biomart-other-than-ensembl). We are using plants, so
+
+```{r}
+marts <- listMarts(host = "plants.ensembl.org")
+marts
+```
+
+For now, remember that we will want to use `plants_mart`. 
+
+Next, we need to choose a specific dataset. 
+
+```{r}
+plants_mart <- useMart("plants_mart", host = "plants.ensembl.org" )
+listDatasets(plants_mart)
+```
+
+After a little looking, its the `athaliana_eg_gene` dataset that we need. Finally, we need to update our `plants_mart` to be more specific. 
+
+```{r}
+plants_mart <- useMart("plants_mart", dataset = "athaliana_eg_gene", host="plants.ensembl.org" )
+```
+
+Now we want to get specific attributes from the list of genes we can import from biomart
+
+```{r}
+listAttributes(plants_mart)
+```
+
+We can choose whichever of these we'd like to use. Let's get transcript ids, gene ids, a description, and gene names. Notice, there are many things you may 
+want to come back for. We must get the transcript id because these are the names of the transcripts that were used in our Kallisto quantification. 
+
+```{r}
+t2g <- getBM(attributes = c("ensembl_transcript_id", 
+                            "ensembl_gene_id", 
+                            "description",
+                            "external_gene_name"), 
+             mart = plants_mart)
+```
+
+We need to make sure the `ensembl_transcript_id` column is named `target_id`
+
+```{r}
+ttg <- dplyr::rename(t2g, target_id= ensembl_transcript_id, ens_gene = ensembl_gene_id, ext_gene = external_gene_name)
+```
+
+
+### Prepare data for Sleuth 
+
+first we need to alter our experimental design so that we consider the full transcriptome sample to be the "control" to compare to...
+
+```{r}
+s2c$condition <- relevel(s2c$condition, ref = "total_transctriptome")
+```
+
+
+Now we need to tell Sleuth both about the Kallisto results and the gene names (and gene descriptions/metadata) we obtained from biomaRt. The `sleuth_prep` function does this. 
+
+```{r}
+so <- sleuth_prep(s2c, 
+                  full_model = ~condition,  
+                  target_mapping = ttg, 
+                  read_bootstrap_tpm=TRUE, 
+                  extra_bootstrap_summary = TRUE)
+```
+
+
+### Examine Sleuth PCA
+
+Next, we should check to see if our samples (and replicates) cluster on a PCA (as should expect) or if there are outliers:
+
+```{r}
+plot_pca(so, color_by = 'condition', text_labels = TRUE)
+```
+
+The SRR064158 looks like an outlier so let's remove that from our analysis. As an exercise come back to see what this analysis looks like without doing this. 
+
+```{r}
+
+s2c <- dplyr::filter(s2c, sample != 'SRR064158_quant')
+so <- sleuth_prep(s2c, 
+                  full_model = ~condition,  
+                  target_mapping = ttg, 
+                  read_bootstrap_tpm=TRUE, 
+                  extra_bootstrap_summary = TRUE)
+```
+
+let's rerun the PCA
+
+```{r}
+plot_pca(so, color_by = 'condition', text_labels = TRUE)
+```
+
+
+We can also see genes involved in the the 1st PC by looking at the loadings (primary genes whose linear combinations define the principal components)
+
+```{r}
+plot_loadings(so, pc_input = 1)
+```
+
+## Differential expression testing with Sleuth 
+
+Now we need to run a few functions that will test for differential expression (abundance). 
+
+First we will create a model
+
+```{r}
+so <- sleuth_fit(so, ~condition, 'full')
+so <- sleuth_fit(so, ~1, 'reduced')
+so <- sleuth_lrt(so, 'reduced', 'full')
+```
+
+Now we can get the results of this analysis
+
+```{r}
+full_results <- sleuth_results(so, 'reduced:full', 'lrt',
+                               show_all = FALSE)
+head(full_results)
+```
+
+
+
+Let's add  Wald test
+```{r}
+wald_test <- colnames(design_matrix(so))[2]
+so <- sleuth_wt(so, wald_test)
+```
+
+And start a Shiny Browser
+
+```{r}
+sleuth_live(so)
+```
+
+
+
+
+
+
+
+
+
