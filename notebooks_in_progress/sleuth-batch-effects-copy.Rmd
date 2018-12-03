@@ -1,0 +1,318 @@
+---
+title: "Sleuth Bulk RNA-Seq and Batch Effects Tutorial"
+output: html_notebook
+---
+
+This tutorial will take you through a sample RNA-Seq analysis using performed by [kallisto](https://pachterlab.github.io/kallisto/about), using an RNA-Seq R package [Sleuth](https://pachterlab.github.io/sleuth/about). This tutorial is based on the one by the [Pachter lab](https://pachterlab.github.io/sleuth_walkthroughs/boj/analysis.html). 
+
+## Load Sleuth 
+
+Next, we need to load the Sleuth library to begin. We will also check the version:
+```{r message=FALSE}
+library("sleuth")
+packageVersion("sleuth")
+```
+
+## Locate sample names and describe our experimental design
+
+First we will get a list of samples id's as corresponds to the folders where the Kallisto outputs have been stored
+
+```{r}
+sample_id <- dir(file.path("~/tutorial-data/kallisto-bulk/analyses/kallisto-quantification/"))
+sample_id
+```
+
+
+We need to provide file paths to the results from kallisto:
+```{r}
+kal_dirs <- file.path("~/tutorial-data/kallisto-bulk/analyses/kallisto-quantification", sample_id)
+kal_dirs
+```
+
+We an existing CSV file that provides metadata about our experiment, let's load that:
+
+```{r}
+experiment_info <- read.csv("~/tutorial-data/kallisto-bulk/data/study_design/zikadesignmatrix.csv", stringsAsFactors = FALSE)
+experiment_info
+```
+
+We will add our file paths to the table
+
+```{r}
+s2c <- dplyr::mutate(experiment_info, path = kal_dirs)
+```
+
+Let's view the table we have created:
+```{r}
+s2c
+```
+
+
+## Create the Sleuth Object
+
+"
+first we need explicitly create levels in our table, marking "mock" as our control ...
+
+```{r}
+s2c$condition <- as.factor(s2c$condition)
+s2c$condition <- relevel(s2c$condition, ref = "mock")
+s2c
+```
+
+Next, we can use the BiomaRt library to get annotation information... our transcriptome will have ensemble gene names and we may want additional information including common gene names:
+
+This can be a little complex so 
+be sure to read their [documentation](https://www.bioconductor.org/packages/devel/bioc/vignettes/biomaRt/inst/doc/biomaRt.html) and this [blog post](https://nsaunders.wordpress.com/2015/04/28/some-basics-of-biomart/) is also helpful. 
+
+```{r}
+library(biomaRt)
+marts <- listMarts()
+marts
+```
+
+If you are not working with these Ensembl data bases you may want to check out documentation on [using BiomaRts other than Ensembl](https://bioconductor.org/packages/release/bioc/vignettes/biomaRt/inst/doc/biomaRt.html#using-a-biomart-other-than-ensembl).Since this is human data we can use `ENSEMBL_MART_ENSEMBL`. 
+
+```{r}
+ensembl_mart <- useMart("ENSEMBL_MART_ENSEMBL" )
+listDatasets(ensembl_mart)
+```
+
+
+After a little looking, its the `hsapiens_gene_ensembl` dataset that we need. Finally, we need to update our `ensembl_mart` to be more specific. 
+
+```{r}
+ensembl_mart <- useMart("ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl")
+```
+
+Now we want to get specific attributes from the list of genes we can import from biomart
+
+```{r}
+listAttributes(ensembl_mart)
+```
+
+We can choose whichever of these we'd like to use. Let's get transcript ids, gene ids, a description, and gene names. Notice, there are many things you may 
+want to come back for. We must get the transcript id because these are the names of the transcripts that were used in our Kallisto quantification. 
+
+```{r}
+t2g <- getBM(attributes = c("ensembl_transcript_id", 
+                            "ensembl_gene_id", 
+                            "description",
+                            "external_gene_name"), 
+             mart = ensembl_mart)
+```
+
+We need to make sure the `ensembl_transcript_id` column is named `target_id`
+
+```{r}
+ttg <- dplyr::rename(t2g, target_id= ensembl_transcript_id, ens_gene = ensembl_gene_id, ext_gene = external_gene_name)
+```
+
+
+
+Now we need to tell Sleuth both about the Kallisto results and the gene names (and gene descriptions/metadata) we obtained from biomaRt. The `sleuth_prep` function does this. (~5 minutes)
+
+```{r}
+so <- sleuth_prep(s2c, 
+                  full_model = ~condition,  
+                  target_mapping = ttg, 
+                  read_bootstrap_tpm=TRUE, 
+                  extra_bootstrap_summary = TRUE)
+```
+
+
+## Differential expression analysis
+
+We will also load some additional libraries we will need for plotting
+
+```{r}
+library(cowplot)
+library(gridExtra)
+```
+
+Next, we should check to see if our samples (and replicates) cluster on a PCA (as should expect) or if there are outliers:
+
+```{r}
+plot_pca(so, color_by = 'condition', text_labels = TRUE)
+```
+
+
+We successfully replicate the figure in the [paper](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0175744) this data were taken from. Uninfected (mock) cluster on the left of the PC1 axis, and zika-infected are on the right. Along the second component, we can see that there is variation due to the sequencing platform. We can redraw the plot to demonstrate this:
+
+```{r}
+plot_pca(so, color_by = 'Instrument', text_labels = TRUE)
+```
+
+
+This is not optimal ... ideally we would have loaded samples prepared on the same day, in the same way, and run on the same machine. This particular circumstance could be worse... we could have done all zika or all mock samples on one machine, rather than having one of each type of condition on each of the machines. We can see how much of the variation the components account for by looking at the loading directly:
+
+
+```{r}
+plot_loadings(so,pc_count = 10) + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+We will come back to batch effects later. 
+
+
+## Tests and visualizations.
+
+
+Now we need to run a few functions that will test for differential expression (abundance).To identify genes differential between two conditions two models must be fit by sleuth.
+
+We need two (linear) models to compare:
+
+- Full model: This is a model of the abundance estimates taking into account our experimental conditions
+
+```{r}
+so <- sleuth_fit(so, ~condition, 'full')
+```
+Occasionally, you will get some warning about genes/transcripts that were dropped from analysis. These don't have to be a problem, but you may want to make sure your favorite has not been lost. 
+
+
+- Reduced model: This model (null hypothesis) assumes that abundances are equal between the conditions
+```{r}
+so <- sleuth_fit(so, ~1, 'reduced')
+```
+
+Finally, a likelihood ratio test sleuth identifies genes whose abundances are significantly better explained when strain is taken into account.
+
+```{r}
+so <- sleuth_lrt(so, 'reduced', 'full')
+```
+
+Now we can get the results of this analysis
+
+```{r}
+full_results <- sleuth_results(so, 'reduced:full', 'lrt',
+                               show_all = FALSE)
+full_results_signifigant <- dplyr::filter(full_results, qval <= 0.05)
+head(full_results_signifigant, 20)
+```
+
+We can easily plot the result from individual genes
+
+```{r}
+plot_bootstrap(so, "ENST00000253063.3", units = "est_counts", color_by = "condition")
+```
+
+
+
+Let's add  Wald test
+```{r}
+wald_test <- colnames(design_matrix(so))[2]
+so <- sleuth_wt(so, wald_test)
+```
+
+And start a Shiny Browser to view plots interactively
+
+```{r}
+sleuth_live(so)
+```
+
+
+## Examining batch effects
+
+As we saw in the PCA plot, there was a difference in sample, which we can attribute to the differences in instrument. Here is the PCA plots again: 
+
+```{r fig.width=10}
+plot_pca(so, color_by = 'condition', text_labels = TRUE)
+plot_pca(so, color_by = 'Instrument', text_labels = TRUE)
+```
+
+We can make a new linear model and examine how our estimates of abundance would be explained accounting for Instrument type
+
+```{r}
+so <- sleuth_fit(so, ~Instrument, 'Instrument')
+```
+
+And we will perform a log-ratio test with our existing reduced model here as well:
+
+```{r}
+so <- sleuth_lrt(so,'reduced', 'Instrument')
+```
+Now we can pinpoint which genes are most affected by this batch effect:
+
+```{r}
+sleuth_table_instrument <- sleuth_results(so, 'reduced:Instrument','lrt', show_all = FALSE)
+sleuth_significant_instrument <- dplyr::filter(sleuth_table_instrument, qval <= 0.05)
+head(sleuth_significant_instrument, 20)
+```
+
+
+We can now create a model that accounts for differences by condition as well as instrument:
+
+```{r}
+so <- sleuth_fit(so, ~condition + Instrument, 'full')
+```
+
+Now we will compare the instrument model with the 'full' model that accounts for both
+
+```{r}
+so <- sleuth_lrt(so, 'Instrument', 'full')
+sleuth_table_full <- sleuth_results(so, 'Instrument:full', 'lrt', show_all = FALSE)
+sleuth_significant_instrument_condition <- dplyr::filter(sleuth_table_full, qval <= 0.05)
+head(sleuth_significant_instrument_condition, 20)
+```
+
+There are some similarities and differences but let's look more systematically...
+
+```{r}
+tmp <- dplyr::inner_join(
+  dplyr::mutate(
+    dplyr::select(full_results_signifigant, target_id, qval_condition = qval),
+    rank_condition = 1:length(qval_condition)),
+  dplyr::mutate(
+    dplyr::select(sleuth_significant_instrument_condition, target_id, qval_account_for_batch = qval),
+    rank_account_for_batch = 1:length(qval_account_for_batch))
+  ,
+  by = 'target_id')
+```
+
+We'll get the relative difference between the ranked lists of values
+
+```{r}
+tmp <- dplyr::mutate(tmp,
+  relative_difference = abs(rank_account_for_batch - rank_condition) / (rank_account_for_batch + rank_condition))
+```
+
+We can then join few of these
+
+```{r}
+top_different <- dplyr::arrange(head(tmp, 100), desc(relative_difference))
+p <- lapply(top_different$target_id[1:4],
+  function(x) {
+    plot_bootstrap(so, x, color_by = 'condition')
+  })
+```
+
+And then plot
+```{r fig.height=10, fig.width=10}
+plot_grid(plotlist = p)+ theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+### Comparing effect sizes
+
+We can also get a gene by gene look at how these batch effects impacted each gene
+```{r}
+full_model <- extract_model(so, 'full')
+condition_model <- extract_model(so, 'condition')
+```
+
+We can then generate the comparison which includes all the parameters for our model, but here pulls out the full vs instrument models
+
+```{r}
+effect_sizes <- dplyr::inner_join(
+  dplyr::select(dplyr::filter(full_model, grepl('condition', term)),
+    target_id, full_estimate = estimate),
+  dplyr::select(dplyr::filter(condition_model, grepl('condition', term)),
+    target_id, condition_estimate = estimate),
+  by = 'target_id'
+  )
+dplyr::inner_join(
+  dplyr::select(top_different[1:100, ], target_id),
+  effect_sizes,
+  by = 'target_id')
+```
+
+In this case, the batch effects are minimal. 
+ 
+
